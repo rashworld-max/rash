@@ -264,7 +264,9 @@ See [Cloud / AWS / IAM Authentication]({{< ref "/cloud/aws#iam-authentication" >
 |**Valid values**|AWS Secrets Manager ARN|
 |**Default value**||
 
-The `password-secret` variables sets the AWS Secrets Manager ARN that contains the MySQL user password.
+The `password-secret` variable sets the AWS Secrets Manager ARN that contains the MySQL user password.
+When using the default parser, the secret JSON must contain a string `password` field, and it can optionally contain a string `username` field.
+Custom integrations can override this with [`Plugins.ParsePasswordSecret`]({{< ref "/develop/integration-api#aws-password-secrets" >}}).
 
 #### `region`
 

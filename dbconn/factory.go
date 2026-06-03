@@ -32,17 +32,33 @@ var portSuffix = regexp.MustCompile(`:\d+$`)
 
 // factory is the internal implementation of blip.DbFactory.
 type factory struct {
-	awsConfig blip.AWSConfigFactory
-	modifyDB  func(*sql.DB, string)
+	awsConfig            blip.AWSConfigFactory
+	modifyDB             func(*sql.DB, string)
+	passwordSecretParser blip.PasswordSecretParser
+}
+
+// ConnFactoryOption configures the default MySQL connection factory.
+type ConnFactoryOption func(*factory)
+
+// WithPasswordSecretParser sets the parser used for AWS Secrets Manager
+// password-secret payloads.
+func WithPasswordSecretParser(parser blip.PasswordSecretParser) ConnFactoryOption {
+	return func(f *factory) {
+		f.passwordSecretParser = parser
+	}
 }
 
 // NewConnFactory returns a blip.NewConnFactory that connects to MySQL.
 // This is the only blip.NewConnFactor. It is created in Server.Defaults.
-func NewConnFactory(awsConfig blip.AWSConfigFactory, modifyDB func(*sql.DB, string)) factory {
-	return factory{
+func NewConnFactory(awsConfig blip.AWSConfigFactory, modifyDB func(*sql.DB, string), opts ...ConnFactoryOption) factory {
+	f := factory{
 		awsConfig: awsConfig,
 		modifyDB:  modifyDB,
 	}
+	for _, opt := range opts {
+		opt(&f)
+	}
+	return f
 }
 
 // Make makes a *sql.DB for the given monitor config. On success, it also returns
@@ -288,35 +304,7 @@ func (f factory) Credentials(cfg blip.ConfigMonitor) (CredentialFunc, error) {
 			return nil, err
 		}
 		secret := aws.NewSecret(cfg.AWS.PasswordSecret, awscfg)
-		return func(ctx context.Context) (Credentials, error) {
-			newSecret, err := secret.GetSecret(ctx)
-			if err != nil {
-				return Credentials{}, err
-			}
-
-			username, ok := newSecret["username"]
-			if !ok {
-				// The username key is optional. Default to config
-				username = cfg.Username
-			}
-			usernameStr, ok := username.(string)
-			if !ok {
-				username = cfg.Username
-			}
-			password, ok := newSecret["password"]
-			if !ok {
-				return Credentials{}, fmt.Errorf("error retrieving 'password' value of secret")
-			}
-			passwordStr, ok := password.(string)
-			if !ok {
-				return Credentials{}, fmt.Errorf("invalid type for 'password' value of secret")
-			}
-
-			return Credentials{
-				Password: passwordStr,
-				Username: usernameStr,
-			}, nil
-		}, nil
+		return f.passwordSecretCredentialFunc(cfg, secret), nil
 	}
 
 	// Password file, could be "rotated" (new password written to file)
@@ -362,6 +350,36 @@ func (f factory) Credentials(cfg blip.ConfigMonitor) (CredentialFunc, error) {
 	return func(context.Context) (Credentials, error) {
 		return Credentials{Password: "", Username: cfg.Username}, nil
 	}, nil
+}
+
+type passwordSecretGetter interface {
+	GetSecretPayload(context.Context) ([]byte, error)
+}
+
+func (f factory) passwordSecretCredentialFunc(cfg blip.ConfigMonitor, secret passwordSecretGetter) CredentialFunc {
+	parser := f.passwordSecretParser
+	if parser == nil {
+		parser = blip.DefaultPasswordSecretParser
+	}
+
+	return func(ctx context.Context) (Credentials, error) {
+		payload, err := secret.GetSecretPayload(ctx)
+		if err != nil {
+			return Credentials{}, err
+		}
+
+		parsedSecret := blip.Secret{
+			Username: cfg.Username,
+		}
+		if err := parser(ctx, cfg, payload, &parsedSecret); err != nil {
+			return Credentials{}, err
+		}
+
+		return Credentials{
+			Password: parsedSecret.Password,
+			Username: parsedSecret.Username,
+		}, nil
+	}
 }
 
 // --------------------------------------------------------------------------

@@ -107,12 +107,12 @@ If everything is configured correctly in both Blip and AWS, Blip should work as 
 
 Blip can fetch its MySQL password from a secret in [AWS Secrets Manager](https://aws.amazon.com/secrets-manager/).
 Set [`config.aws.password-secret`]({{< ref "/config/config-file#password-secret" >}}) to the ARN of the secret.
-The secret value must be a key-value map with a `password` key, like:
+By default, the secret value must be a JSON object with a string `password` key, like:
 
 ```json
 {
   "username": "blip",
-  "password": "...",    // Blip uses only this value
+  "password": "...",
   "engine": "mysql",
   "host": "db.cluster.us-east-1.rds.amazonaws.com",
   "port": 3306,
@@ -120,12 +120,19 @@ The secret value must be a key-value map with a `password` key, like:
 }
 ```
 
-Blip ignores other keys in the secret value; it only reads the `password` key-value.
+By default, Blip ignores other keys in the secret value and reads only `username` and `password`.
+The `username` key is optional; if it is not set, Blip uses the configured monitor username.
 
 {{< hint type=note >}}
 The example above is the default secret map that AWS creates for RDS.
-It works with Blip, but Blip currently ignores the non-password fields.
+It works with Blip, but Blip ignores the connection fields like `host` and `port`.
 {{< /hint >}}
+
+If you embed Blip and use a different secret payload shape, set the
+[`blip.Plugins.ParsePasswordSecret`](https://pkg.go.dev/github.com/cashapp/blip#Plugins)
+callback before calling `Server.Boot`.
+The callback receives one raw payload: `SecretString` bytes when present, otherwise `SecretBinary` bytes.
+It should set the password and, if needed, username on the secret value passed to it.
 
 The [AWS credentials](#credentials) that Blip uses must be allowed to read the secret with a policy privilege like:
 

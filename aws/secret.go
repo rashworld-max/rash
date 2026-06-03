@@ -26,6 +26,22 @@ func NewSecret(name string, cfg aws.Config) Secret {
 }
 
 func (s Secret) GetSecret(ctx context.Context) (map[string]interface{}, error) {
+	payload, err := s.GetSecretPayload(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var v map[string]interface{}
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return nil, fmt.Errorf("cannot decode secret string as map[string]interface{}: %s", err)
+	}
+	if v == nil {
+		return nil, fmt.Errorf("secret value is 'null' literal")
+	}
+	return v, nil
+}
+
+func (s Secret) GetSecretPayload(ctx context.Context) ([]byte, error) {
 	input := &secretsmanager.GetSecretValueInput{
 		SecretId:     aws.String(s.name),
 		VersionStage: aws.String("AWSCURRENT"),
@@ -35,18 +51,22 @@ func (s Secret) GetSecret(ctx context.Context) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Secrets Manager API error: %s", err)
 	}
-	blip.Debug("DEBUG: aws secret: %+v", *sv)
+	name := ""
+	if sv.Name != nil {
+		name = *sv.Name
+	}
+	versionID := ""
+	if sv.VersionId != nil {
+		versionID = *sv.VersionId
+	}
+	blip.Debug("DEBUG: aws secret: name=%s version=%s", name, versionID)
 
-	if sv.SecretString == nil || *sv.SecretString == "" {
-		return nil, fmt.Errorf("secret string is nil or empty")
+	if sv.SecretString != nil && *sv.SecretString != "" {
+		return []byte(*sv.SecretString), nil
+	}
+	if len(sv.SecretBinary) > 0 {
+		return append([]byte(nil), sv.SecretBinary...), nil
 	}
 
-	var v map[string]interface{}
-	if err := json.Unmarshal([]byte(*sv.SecretString), &v); err != nil {
-		return nil, fmt.Errorf("cannot decode secret string as map[string]string: %s", err)
-	}
-	if v == nil {
-		return nil, fmt.Errorf("secret value is 'null' literal")
-	}
-	return v, nil
+	return nil, fmt.Errorf("secret string and secret binary are empty")
 }

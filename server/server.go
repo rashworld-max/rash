@@ -178,7 +178,11 @@ func (s *Server) Boot(env blip.Env, plugins blip.Plugins, factories blip.Factori
 	}
 
 	if factories.DbConn == nil {
-		factories.DbConn = dbconn.NewConnFactory(factories.AWSConfig, plugins.ModifyDB)
+		factories.DbConn = dbconn.NewConnFactory(
+			factories.AWSConfig,
+			plugins.ModifyDB,
+			dbconn.WithPasswordSecretParser(plugins.ParsePasswordSecret),
+		)
 	}
 
 	sink.InitFactory(factories)
