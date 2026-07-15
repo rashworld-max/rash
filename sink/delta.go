@@ -5,7 +5,9 @@ package sink
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cashapp/blip"
 )
@@ -20,8 +22,16 @@ import (
 // can cause incorrect metric values to be submitted then delta calculations are performed.
 // The Delta sink should never be wrapped inside of a Retry sink to prevent this.
 type Delta struct {
-	sink     blip.Sink
-	counters map[string]float64 // holds last value of the counter so deltas can be calculated
+	sink blip.Sink
+	mu   sync.Mutex
+
+	counters map[metricID]float64 // holds last value of the counter so deltas can be calculated
+}
+
+type metricID struct {
+	domain string
+	name   string
+	group  string
 }
 
 var _ blip.Sink = &Delta{}
@@ -36,7 +46,7 @@ func NewDelta(sink blip.Sink) *Delta {
 
 	return &Delta{
 		sink:     sink,
-		counters: make(map[string]float64),
+		counters: make(map[metricID]float64),
 	}
 }
 
@@ -51,6 +61,16 @@ func (d *Delta) Name() string {
 //
 // This is safe to call from multiple goroutines.
 func (d *Delta) Send(ctx context.Context, metrics *blip.Metrics) error {
+	return d.sink.Send(ctx, d.transform(metrics))
+}
+
+func (d *Delta) transform(metrics *blip.Metrics) *blip.Metrics {
+	// Protect counter state and transformation, but do not serialize the
+	// wrapped sink: Retry depends on accepting a new batch while an earlier
+	// batch is still in flight.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	newValues := make(map[string][]blip.MetricValue)
 	hasNewValues := false
 
@@ -64,18 +84,18 @@ func (d *Delta) Send(ctx context.Context, metrics *blip.Metrics) error {
 			case blip.CUMULATIVE_COUNTER:
 				hasDelta = true
 				metricValue := value.Value
-				metricId := d.metricID(value.Name, value.Group)
+				id := d.metricID(key, value.Name, value.Group)
 
-				val, ok := d.counters[metricId]
+				val, ok := d.counters[id]
 				if !ok {
 					// If we don't have a prior data point then we should
 					// not calculate a delta and just remove the point.
-					d.counters[metricId] = value.Value
+					d.counters[id] = value.Value
 					continue
 				}
 
 				delta := value.Value - val
-				d.counters[metricId] = value.Value
+				d.counters[id] = value.Value
 				if delta >= 0 {
 					metricValue = delta
 				} else {
@@ -104,25 +124,18 @@ func (d *Delta) Send(ctx context.Context, metrics *blip.Metrics) error {
 
 	if !hasNewValues {
 		// If we didn't have to calculate any deltas then we should
-		// just submit the original metrics
-		return d.sink.Send(ctx, metrics)
+		// just return the original metrics.
+		return metrics
 	}
 
-	return d.sink.Send(ctx, &blip.Metrics{
-		Begin:     metrics.Begin,
-		End:       metrics.End,
-		MonitorId: metrics.MonitorId,
-		Plan:      metrics.Plan,
-		Level:     metrics.Level,
-		State:     metrics.State,
-		Values:    newValues,
-	})
+	transformed := *metrics
+	transformed.Values = newValues
+	return &transformed
 }
 
-// metricID returns the metric name concatenated with sorted group keys.
-// For example, if the metric name is "foo" and the group keys are "a" and "b",
-// it returns "fooab". This is used to calculate delta counter values in Send.
-func (s *Delta) metricID(name string, groups map[string]string) string {
+// metricID identifies one cumulative counter series. Group entries are sorted
+// and length-prefixed so keys, values, and their boundaries are unambiguous.
+func (d *Delta) metricID(domain, name string, groups map[string]string) metricID {
 	keys := make([]string, 0, len(groups))
 	for k := range groups {
 		keys = append(keys, k)
@@ -131,15 +144,16 @@ func (s *Delta) metricID(name string, groups map[string]string) string {
 	// sort by keys
 	sort.Strings(keys)
 
-	var values []string
-	// collect values by sorted keys
+	var group strings.Builder
 	for _, k := range keys {
-		values = append(values, groups[k])
+		value := groups[k]
+		group.WriteString(strconv.Itoa(len(k)))
+		group.WriteByte(':')
+		group.WriteString(k)
+		group.WriteString(strconv.Itoa(len(value)))
+		group.WriteByte(':')
+		group.WriteString(value)
 	}
 
-	var key string
-	key += name
-	key += strings.Join(values, "")
-
-	return key
+	return metricID{domain: domain, name: name, group: group.String()}
 }
