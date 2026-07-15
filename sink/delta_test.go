@@ -2,6 +2,8 @@ package sink
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,6 +69,7 @@ func TestDeltaSink(t *testing.T) {
 		MonitorId: "testmonitor",
 		Plan:      "testplan",
 		Level:     "testlevel",
+		Interval:  42,
 		State:     "teststate",
 		Values: map[string][]blip.MetricValue{
 			"nochanges": noChangesValues,
@@ -95,6 +98,7 @@ func TestDeltaSink(t *testing.T) {
 		MonitorId: "testmonitor",
 		Plan:      "testplan",
 		Level:     "testlevel",
+		Interval:  metrics.Interval,
 		State:     "teststate",
 		Values: map[string][]blip.MetricValue{
 			"nochanges": noChangesValues,
@@ -125,6 +129,7 @@ func TestDeltaSink(t *testing.T) {
 		MonitorId: "testmonitor",
 		Plan:      "testplan",
 		Level:     "testlevel",
+		Interval:  43,
 		State:     "teststate",
 		Values: map[string][]blip.MetricValue{
 			"nochanges": noChangesValues,
@@ -148,6 +153,7 @@ func TestDeltaSink(t *testing.T) {
 		MonitorId: "testmonitor",
 		Plan:      "testplan",
 		Level:     "testlevel",
+		Interval:  metrics.Interval,
 		State:     "teststate",
 		Values: map[string][]blip.MetricValue{
 			"nochanges": noChangesValues,
@@ -179,6 +185,152 @@ func TestDeltaSink(t *testing.T) {
 
 	if diff := deep.Equal(expectedMetrics, returnedResults); diff != nil {
 		t.Error(diff)
+	}
+}
+
+func TestDeltaSinkSeriesIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		values map[string][]blip.MetricValue
+	}{
+		{
+			name: "domain",
+			values: map[string][]blip.MetricValue{
+				"domain-1": {{Name: "counter", Value: 10, Type: blip.CUMULATIVE_COUNTER}},
+				"domain-2": {{Name: "counter", Value: 20, Type: blip.CUMULATIVE_COUNTER}},
+			},
+		},
+		{
+			name: "group keys",
+			values: map[string][]blip.MetricValue{
+				"domain": {
+					{Name: "counter", Value: 10, Type: blip.CUMULATIVE_COUNTER, Group: map[string]string{"a": "1"}},
+					{Name: "counter", Value: 20, Type: blip.CUMULATIVE_COUNTER, Group: map[string]string{"b": "1"}},
+				},
+			},
+		},
+		{
+			name: "group value boundaries",
+			values: map[string][]blip.MetricValue{
+				"domain": {
+					{Name: "counter", Value: 10, Type: blip.CUMULATIVE_COUNTER, Group: map[string]string{"a": "12", "b": "3"}},
+					{Name: "counter", Value: 20, Type: blip.CUMULATIVE_COUNTER, Group: map[string]string{"a": "1", "b": "23"}},
+				},
+			},
+		},
+		{
+			name: "metric name boundary",
+			values: map[string][]blip.MetricValue{
+				"domain": {
+					{Name: "counter-1", Value: 10, Type: blip.CUMULATIVE_COUNTER, Group: map[string]string{"a": "23"}},
+					{Name: "counter-12", Value: 20, Type: blip.CUMULATIVE_COUNTER, Group: map[string]string{"a": "3"}},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *blip.Metrics
+			deltaSink := NewDelta(&mock.Sink{SendFunc: func(_ context.Context, m *blip.Metrics) error {
+				got = m
+				return nil
+			}})
+
+			if err := deltaSink.Send(context.Background(), &blip.Metrics{Values: tt.values}); err != nil {
+				t.Fatal(err)
+			}
+
+			for domain, values := range got.Values {
+				if len(values) != 0 {
+					t.Errorf("first sample for %s emitted %d values; want none: %+v", domain, len(values), values)
+				}
+			}
+		})
+	}
+}
+
+func TestDeltaSinkConcurrentSend(t *testing.T) {
+	const sends = 100
+
+	var (
+		mu       sync.Mutex
+		received = make(map[string]float64)
+	)
+	deltaSink := NewDelta(&mock.Sink{SendFunc: func(_ context.Context, m *blip.Metrics) error {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, values := range m.Values {
+			for _, value := range values {
+				received[value.Group["id"]] = value.Value
+			}
+		}
+		return nil
+	}})
+
+	sendAll := func(value float64) {
+		t.Helper()
+		var wg sync.WaitGroup
+		for i := 0; i < sends; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				id := fmt.Sprintf("counter-%d", i)
+				err := deltaSink.Send(context.Background(), &blip.Metrics{Values: map[string][]blip.MetricValue{
+					"domain": {{
+						Name:  "counter",
+						Value: value,
+						Type:  blip.CUMULATIVE_COUNTER,
+						Group: map[string]string{"id": id},
+					}},
+				}})
+				if err != nil {
+					t.Errorf("send %s: %v", id, err)
+				}
+			}(i)
+		}
+		wg.Wait()
+	}
+
+	sendAll(10)
+	sendAll(11)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != sends {
+		t.Fatalf("received %d deltas; want %d", len(received), sends)
+	}
+	for id, value := range received {
+		if value != 1 {
+			t.Errorf("%s delta = %v; want 1", id, value)
+		}
+	}
+}
+
+func TestDeltaSinkCounterReset(t *testing.T) {
+	var got *blip.Metrics
+	deltaSink := NewDelta(&mock.Sink{SendFunc: func(_ context.Context, m *blip.Metrics) error {
+		got = m
+		return nil
+	}})
+
+	send := func(value float64) {
+		t.Helper()
+		if err := deltaSink.Send(context.Background(), &blip.Metrics{Values: map[string][]blip.MetricValue{
+			"domain": {{Name: "counter", Value: value, Type: blip.CUMULATIVE_COUNTER}},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send(100)
+	send(5)
+	if value := got.Values["domain"][0].Value; value != 5 {
+		t.Fatalf("reset delta = %v; want current partial value 5", value)
+	}
+	send(8)
+	if value := got.Values["domain"][0].Value; value != 3 {
+		t.Fatalf("post-reset delta = %v; want 3", value)
 	}
 }
 
