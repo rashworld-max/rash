@@ -6,11 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
 	"github.com/stretchr/testify/require"
 
@@ -19,6 +22,29 @@ import (
 
 type rejectThenFailSubmitter struct {
 	calls int
+}
+
+type payloadLimitSubmitter struct {
+	maxCompressed   int
+	maxDecompressed int
+	requests        int
+	rejected        int
+	acceptedSeries  []datadogV2.MetricSeries
+}
+
+func (s *payloadLimitSubmitter) Submit(_ context.Context, payload preparedDatadogPayload) (datadogSubmitResult, error) {
+	s.requests++
+	if payload.compressedBytes > s.maxCompressed || payload.uncompressedBytes > s.maxDecompressed {
+		s.rejected++
+		return datadogSubmitResult{statusCode: http.StatusRequestEntityTooLarge}, errors.New("payload too large")
+	}
+
+	decoded, err := decodePreparedMetricPayload(payload)
+	if err != nil {
+		return datadogSubmitResult{}, err
+	}
+	s.acceptedSeries = append(s.acceptedSeries, decoded.Series...)
+	return datadogSubmitResult{statusCode: http.StatusAccepted}, nil
 }
 
 type checkpointFailureSubmitter struct {
@@ -33,8 +59,8 @@ func (s *checkpointFailureSubmitter) Submit(_ context.Context, payload preparedD
 		return datadogSubmitResult{}, errors.New("injected checkpoint failure")
 	}
 
-	var decoded datadogV2.MetricPayload
-	if err := json.Unmarshal(payload.body, &decoded); err != nil {
+	decoded, err := decodePreparedMetricPayload(payload)
+	if err != nil {
 		return datadogSubmitResult{}, err
 	}
 	if s.acceptedNames == nil {
@@ -48,6 +74,63 @@ func (s *checkpointFailureSubmitter) Submit(_ context.Context, payload preparedD
 	return datadogSubmitResult{statusCode: http.StatusAccepted}, nil
 }
 
+func decodePreparedMetricPayload(payload preparedDatadogPayload) (datadogV2.MetricPayload, error) {
+	body := payload.body
+	if payload.compressed {
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return datadogV2.MetricPayload{}, err
+		}
+		body, err = io.ReadAll(reader)
+		if err != nil {
+			return datadogV2.MetricPayload{}, err
+		}
+		if err := reader.Close(); err != nil {
+			return datadogV2.MetricPayload{}, err
+		}
+	}
+
+	var decoded datadogV2.MetricPayload
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return datadogV2.MetricPayload{}, err
+	}
+	return decoded, nil
+}
+
+func testMetricSeries(count int) []datadogV2.MetricSeries {
+	series := make([]datadogV2.MetricSeries, count)
+	for i := range series {
+		series[i] = datadogV2.MetricSeries{
+			Metric: fmt.Sprintf("mysql.test.metric_%04d", i),
+			Type:   datadogV2.METRICINTAKETYPE_GAUGE.Ptr(),
+			Points: []datadogV2.MetricPoint{{
+				Timestamp: datadog.PtrInt64(1_700_000_000),
+				Value:     datadog.PtrFloat64(float64(i)),
+			}},
+			Tags: []string{
+				fmt.Sprintf("table:table_%04d", i),
+				"description:" + strings.Repeat("x", 100),
+			},
+		}
+	}
+	return series
+}
+
+func testMetricsMetadata() *blip.Metrics {
+	return &blip.Metrics{MonitorId: "test", Plan: "test", Level: "test", Interval: 1}
+}
+
+func newTestDatadogSender(submitter datadogMetricSubmitter) *Datadog {
+	sender := &Datadog{
+		monitorId:     "test",
+		compress:      true,
+		payloadLimits: defaultDatadogPayloadLimits(),
+		submitter:     submitter,
+	}
+	sender.maxSeriesPerRequest.Store(int64(sender.payloadLimits.maxSeries))
+	return sender
+}
+
 func (s *rejectThenFailSubmitter) Submit(context.Context, preparedDatadogPayload) (datadogSubmitResult, error) {
 	s.calls++
 	if s.calls == 1 {
@@ -57,7 +140,7 @@ func (s *rejectThenFailSubmitter) Submit(context.Context, preparedDatadogPayload
 }
 
 func TestPrepareDatadogPayloadHonorsCompressedLimit(t *testing.T) {
-	series := catalystMetricSeriesSized(1_000, 0, 0)
+	series := testMetricSeries(1_000)
 	limits := datadogPayloadLimits{
 		maxCompressed:      1_000,
 		maxDecompressed:    1_000_000,
@@ -85,24 +168,24 @@ func TestPrepareDatadogPayloadHonorsCompressedLimit(t *testing.T) {
 }
 
 func TestDatadog413FallbackHalvesAndPersistsLimit(t *testing.T) {
-	series := catalystMetricSeriesSized(1_000, 0, 0)
-	intake := newCatalystIntake()
+	series := testMetricSeries(1_000)
+	intake := &payloadLimitSubmitter{
+		maxCompressed:   datadogMaxCompressedPayloadSize,
+		maxDecompressed: 80_000,
+	}
 	// Simulate an effective server limit lower than the documented limit. The
 	// locally valid first payload should receive 413 and trigger bounded halving.
-	intake.maxDecompressed = 150_000
+	sender := newTestDatadogSender(intake)
+	require.NoError(t, sender.sendAPI(context.Background(), series, testMetricsMetadata()))
 
-	sender := newCatalystDatadogSender(intake)
-	require.NoError(t, sender.sendAPI(context.Background(), series, catalystMetricsMetadata()))
-
-	stats := intake.snapshot()
-	require.Greater(t, stats.rejected, 0)
-	require.Len(t, stats.acceptedSeries, len(series))
+	require.Greater(t, intake.rejected, 0)
+	require.Len(t, intake.acceptedSeries, len(series))
 	require.Less(t, sender.maxSeriesPerRequest.Load(), int64(len(series)))
-	require.Equal(t, stats.requests, stats.rejected+stats.accepted)
+	require.Greater(t, intake.requests, intake.rejected)
 }
 
 func TestDatadog413LimitSurvivesLaterFailure(t *testing.T) {
-	series := catalystMetricSeriesSized(10, 0, 0)
+	series := testMetricSeries(10)
 	submitter := &rejectThenFailSubmitter{}
 	sender := &Datadog{
 		compress:      true,
@@ -111,7 +194,7 @@ func TestDatadog413LimitSurvivesLaterFailure(t *testing.T) {
 	}
 	sender.maxSeriesPerRequest.Store(int64(len(series)))
 
-	err := sender.sendAPI(context.Background(), series, catalystMetricsMetadata())
+	err := sender.sendAPI(context.Background(), series, testMetricsMetadata())
 	require.ErrorContains(t, err, "network failure")
 	require.Equal(t, 2, submitter.calls)
 	require.Equal(t, int64(len(series)/2), sender.maxSeriesPerRequest.Load())
@@ -121,7 +204,7 @@ func TestPrepareDatadogPayloadStopsOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	series := catalystMetricSeriesSized(10, 0, 0)
+	series := testMetricSeries(10)
 	_, _, err := prepareDatadogPayload(ctx, series, 0, 10, true, defaultDatadogPayloadLimits())
 	require.ErrorIs(t, err, context.Canceled)
 }
