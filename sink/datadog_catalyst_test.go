@@ -11,8 +11,11 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
@@ -134,8 +137,8 @@ func catalystMetricSeries() []datadogV2.MetricSeries {
 	return catalystMetricSeriesSized(catalystSizeTableSeries, catalystWaitTableRows, catalystFixedSeries)
 }
 
-func catalystMetricSeriesSized(sizeTableSeries, waitTableRows, fixedSeries int) []datadogV2.MetricSeries {
-	commonTags := []string{
+func catalystCommonTags() []string {
+	return []string{
 		"infrastructure_type:aurora",
 		"org:database",
 		"team:aurora-mysql",
@@ -156,10 +159,18 @@ func catalystMetricSeriesSized(sizeTableSeries, waitTableRows, fixedSeries int) 
 		"storage_type:aurora",
 		"channel:stable",
 	}
-	resources := []datadogV2.MetricResource{{
+}
+
+func catalystResources() []datadogV2.MetricResource {
+	return []datadogV2.MetricResource{{
 		Name: datadog.PtrString("catalyst-production-aurora-001-instance-1"),
 		Type: datadog.PtrString("host"),
 	}}
+}
+
+func catalystMetricSeriesSized(sizeTableSeries, waitTableRows, fixedSeries int) []datadogV2.MetricSeries {
+	commonTags := catalystCommonTags()
+	resources := catalystResources()
 
 	series := make([]datadogV2.MetricSeries, 0, sizeTableSeries+waitTableRows*catalystWaitMetrics+fixedSeries)
 	appendTableSeries := func(metric string, metricType datadogV2.MetricIntakeType, table int) {
@@ -220,6 +231,81 @@ func catalystMetricsMetadata() *blip.Metrics {
 		Level:     "data-size",
 		Interval:  1,
 	}
+}
+
+func catalystBlipMetrics(series []datadogV2.MetricSeries) *blip.Metrics {
+	metrics := catalystMetricsMetadata()
+	metrics.Begin = time.Unix(1_784_396_000, 0)
+	metrics.End = metrics.Begin.Add(time.Second)
+	metrics.Values = map[string][]blip.MetricValue{}
+	commonTagCount := len(catalystCommonTags())
+
+	for _, item := range series {
+		separator := strings.LastIndexByte(item.Metric, '.')
+		if separator < 1 || separator == len(item.Metric)-1 {
+			panic("invalid Catalyst metric name: " + item.Metric)
+		}
+		metricType := blip.GAUGE
+		if item.Type != nil && *item.Type == datadogV2.METRICINTAKETYPE_COUNT {
+			metricType = blip.DELTA_COUNTER
+		}
+		value := blip.MetricValue{
+			Name:  item.Metric[separator+1:],
+			Value: *item.Points[0].Value,
+			Type:  metricType,
+		}
+		if len(item.Tags) > commonTagCount {
+			value.Group = map[string]string{}
+			for _, tag := range item.Tags[commonTagCount:] {
+				key, val, ok := strings.Cut(tag, ":")
+				if !ok {
+					panic("invalid Catalyst tag: " + tag)
+				}
+				value.Group[key] = val
+			}
+		}
+		domain := item.Metric[:separator]
+		metrics.Values[domain] = append(metrics.Values[domain], value)
+	}
+	return metrics
+}
+
+func canonicalCatalystSeries(series []datadogV2.MetricSeries) []string {
+	encoded := make([]string, len(series))
+	for i := range series {
+		item := series[i]
+		item.Tags = append([]string(nil), item.Tags...)
+		sort.Strings(item.Tags)
+		data, err := json.Marshal(item)
+		if err != nil {
+			panic(err)
+		}
+		encoded[i] = string(data)
+	}
+	sort.Strings(encoded)
+	return encoded
+}
+
+// materializeDatadogSeries models the pre-streaming conversion path: convert
+// the complete Blip batch into one MetricSeries slice before payload sizing.
+func materializeDatadogSeries(sender *Datadog, metrics *blip.Metrics) []datadogV2.MetricSeries {
+	domains := make([]string, 0, len(metrics.Values))
+	total := 0
+	for domain, values := range metrics.Values {
+		domains = append(domains, domain)
+		total += len(values)
+	}
+	sort.Strings(domains)
+	series := make([]datadogV2.MetricSeries, 0, total)
+	for _, domain := range domains {
+		for _, value := range metrics.Values[domain] {
+			converted, ok := sender.datadogMetricSeries(metrics, domain, value)
+			if ok {
+				series = append(series, converted)
+			}
+		}
+	}
+	return series
 }
 
 func catalystAPIClient(intake *catalystIntake) *datadog.APIClient {
@@ -316,6 +402,8 @@ func newCatalystDatadogSender(intake *catalystIntake) *Datadog {
 		monitorId:     "catalyst-production-aurora-001-instance-1",
 		event:         event.MonitorReceiver{MonitorId: "catalyst-production-aurora-001-instance-1"},
 		compress:      true,
+		tags:          catalystCommonTags(),
+		resources:     catalystResources(),
 		payloadLimits: defaultDatadogPayloadLimits(),
 		submitter: &datadogAPISubmitter{
 			client: catalystAPIClient(intake),
@@ -343,26 +431,38 @@ func TestDatadogCatalystHarnessEquivalent(t *testing.T) {
 	require.NoError(t, modern.sendAPI(context.Background(), series, catalystMetricsMetadata()))
 	newStats := newIntake.snapshot()
 
-	legacyJSON, err := json.Marshal(legacyStats.acceptedSeries)
-	require.NoError(t, err)
-	newJSON, err := json.Marshal(newStats.acceptedSeries)
-	require.NoError(t, err)
-	require.Equal(t, legacyJSON, newJSON, "old and new senders must submit identical series and points")
+	finalIntake := newCatalystIntake()
+	final := newCatalystDatadogSender(finalIntake)
+	realMetrics := catalystBlipMetrics(series)
+	require.NoError(t, final.Send(context.Background(), realMetrics))
+	finalStats := finalIntake.snapshot()
+
+	legacyCanonical := canonicalCatalystSeries(legacyStats.acceptedSeries)
+	require.Equal(t, legacyCanonical, canonicalCatalystSeries(newStats.acceptedSeries), "pre and mid senders must submit identical series and points")
+	require.Equal(t, legacyCanonical, canonicalCatalystSeries(finalStats.acceptedSeries), "pre and final senders must submit identical series and points")
 
 	require.Equal(t, catalystTotalSeries, len(legacyStats.acceptedSeries))
 	require.Equal(t, catalystTotalSeries, len(newStats.acceptedSeries))
+	require.Equal(t, catalystTotalSeries, len(finalStats.acceptedSeries))
 	require.Greater(t, legacyStats.rejected, 0, "legacy harness should exercise reactive 413 autosizing")
 	require.Zero(t, newStats.rejected, "new sender should size payloads before submission")
+	require.Zero(t, finalStats.rejected, "streaming sender should size payloads before submission")
 	require.Less(t, newStats.requests, legacyStats.requests)
+	require.Equal(t, newStats.requests, finalStats.requests, "bounded conversion should not add payloads")
 	require.Less(t, newStats.maxRaw, datadogMaxDecompressedPayloadSize)
 	require.LessOrEqual(t, newStats.maxWire, datadogMaxCompressedPayloadSize)
+	require.Less(t, finalStats.maxRaw, datadogMaxDecompressedPayloadSize)
+	require.LessOrEqual(t, finalStats.maxWire, datadogMaxCompressedPayloadSize)
 
 	t.Logf("legacy: requests=%d rejected=%d accepted=%d total-wire=%d total-raw=%d max-wire=%d max-raw=%d",
 		legacyStats.requests, legacyStats.rejected, legacyStats.accepted,
 		legacyStats.totalWire, legacyStats.totalRaw, legacyStats.maxWire, legacyStats.maxRaw)
-	t.Logf("new: requests=%d rejected=%d accepted=%d total-wire=%d total-raw=%d max-wire=%d max-raw=%d",
+	t.Logf("mid: requests=%d rejected=%d accepted=%d total-wire=%d total-raw=%d max-wire=%d max-raw=%d",
 		newStats.requests, newStats.rejected, newStats.accepted,
 		newStats.totalWire, newStats.totalRaw, newStats.maxWire, newStats.maxRaw)
+	t.Logf("final: requests=%d rejected=%d accepted=%d total-wire=%d total-raw=%d max-wire=%d max-raw=%d",
+		finalStats.requests, finalStats.rejected, finalStats.accepted,
+		finalStats.totalWire, finalStats.totalRaw, finalStats.maxWire, finalStats.maxRaw)
 }
 
 func TestDatadogPayloadAlgorithmsEquivalent(t *testing.T) {
@@ -391,18 +491,28 @@ func TestDatadogPayloadAlgorithmsEquivalent(t *testing.T) {
 	require.NoError(t, modern.sendAPI(context.Background(), series, catalystMetricsMetadata()))
 	newStats := newIntake.snapshot()
 
-	legacyJSON, err := json.Marshal(legacyStats.acceptedSeries)
-	require.NoError(t, err)
-	newJSON, err := json.Marshal(newStats.acceptedSeries)
-	require.NoError(t, err)
-	require.Equal(t, legacyJSON, newJSON)
+	finalIntake := newCatalystIntake()
+	finalIntake.maxCompressed = legacyIntake.maxCompressed
+	finalIntake.maxDecompressed = legacyIntake.maxDecompressed
+	final := newCatalystDatadogSender(finalIntake)
+	final.payloadLimits = modern.payloadLimits
+	final.maxSeriesPerRequest.Store(int64(len(series)))
+	require.NoError(t, final.Send(context.Background(), catalystBlipMetrics(series)))
+	finalStats := finalIntake.snapshot()
+
+	legacyCanonical := canonicalCatalystSeries(legacyStats.acceptedSeries)
+	require.Equal(t, legacyCanonical, canonicalCatalystSeries(newStats.acceptedSeries))
+	require.Equal(t, legacyCanonical, canonicalCatalystSeries(finalStats.acceptedSeries))
 	require.Greater(t, legacyStats.rejected, 0)
 	require.Zero(t, newStats.rejected)
+	require.Zero(t, finalStats.rejected)
+	require.Equal(t, newStats.requests, finalStats.requests)
 }
 
 func BenchmarkDatadogCatalystPayload(b *testing.B) {
 	series := catalystMetricSeries()
 	metadata := catalystMetricsMetadata()
+	realMetrics := catalystBlipMetrics(series)
 
 	b.Run("legacy-reactive-autosizer", func(b *testing.B) {
 		b.ReportAllocs()
@@ -411,9 +521,11 @@ func BenchmarkDatadogCatalystPayload(b *testing.B) {
 			b.StopTimer()
 			intake := newCatalystIntake()
 			sender := newLegacyDatadogSender(intake)
+			converter := newCatalystDatadogSender(intake)
 			b.StartTimer()
 
-			if err := sender.Send(context.Background(), series); err != nil {
+			materialized := materializeDatadogSeries(converter, realMetrics)
+			if err := sender.Send(context.Background(), materialized); err != nil {
 				b.Fatal(err)
 			}
 
@@ -430,6 +542,7 @@ func BenchmarkDatadogCatalystPayload(b *testing.B) {
 		b.ReportMetric(float64(totals.rejected)/float64(b.N), "rejected/op")
 		b.ReportMetric(float64(totals.accepted)/float64(b.N), "accepted/op")
 		b.ReportMetric(float64(len(series)), "series/op")
+		b.ReportMetric(float64(len(series)), "max-converted-series/op")
 		b.ReportMetric(float64(totals.totalWire)/float64(b.N), "wire-bytes/op")
 		b.ReportMetric(float64(totals.totalRaw)/float64(b.N), "raw-bytes/op")
 	})
@@ -443,7 +556,8 @@ func BenchmarkDatadogCatalystPayload(b *testing.B) {
 			sender := newCatalystDatadogSender(intake)
 			b.StartTimer()
 
-			if err := sender.sendAPI(context.Background(), series, metadata); err != nil {
+			materialized := materializeDatadogSeries(sender, realMetrics)
+			if err := sender.sendAPI(context.Background(), materialized, metadata); err != nil {
 				b.Fatal(err)
 			}
 
@@ -460,6 +574,38 @@ func BenchmarkDatadogCatalystPayload(b *testing.B) {
 		b.ReportMetric(float64(totals.rejected)/float64(b.N), "rejected/op")
 		b.ReportMetric(float64(totals.accepted)/float64(b.N), "accepted/op")
 		b.ReportMetric(float64(len(series)), "series/op")
+		b.ReportMetric(float64(len(series)), "max-converted-series/op")
+		b.ReportMetric(float64(totals.totalWire)/float64(b.N), "wire-bytes/op")
+		b.ReportMetric(float64(totals.totalRaw)/float64(b.N), "raw-bytes/op")
+	})
+
+	b.Run("checkpointed-streaming-conversion", func(b *testing.B) {
+		b.ReportAllocs()
+		var totals catalystIntakeStats
+		for n := 0; n < b.N; n++ {
+			b.StopTimer()
+			intake := newCatalystIntake()
+			sender := newCatalystDatadogSender(intake)
+			b.StartTimer()
+
+			if err := sender.Send(context.Background(), realMetrics); err != nil {
+				b.Fatal(err)
+			}
+
+			b.StopTimer()
+			stats := intake.snapshot()
+			totals.requests += stats.requests
+			totals.rejected += stats.rejected
+			totals.accepted += stats.accepted
+			totals.totalWire += stats.totalWire
+			totals.totalRaw += stats.totalRaw
+			b.StartTimer()
+		}
+		b.ReportMetric(float64(totals.requests)/float64(b.N), "requests/op")
+		b.ReportMetric(float64(totals.rejected)/float64(b.N), "rejected/op")
+		b.ReportMetric(float64(totals.accepted)/float64(b.N), "accepted/op")
+		b.ReportMetric(float64(len(series)), "series/op")
+		b.ReportMetric(float64(defaultDatadogPayloadLimits().maxSeries), "max-converted-series/op")
 		b.ReportMetric(float64(totals.totalWire)/float64(b.N), "wire-bytes/op")
 		b.ReportMetric(float64(totals.totalRaw)/float64(b.N), "raw-bytes/op")
 	})

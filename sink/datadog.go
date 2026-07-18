@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -69,6 +70,7 @@ func NewDatadog(monitorId string, opts, tags map[string]string, httpClient *http
 			}
 		}
 	}
+	sort.Strings(tagList)
 
 	d := &Datadog{
 		monitorId:     monitorId,
@@ -167,6 +169,10 @@ func NewDatadog(monitorId string, opts, tags map[string]string, httpClient *http
 }
 
 func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
+	return s.send(ctx, m, true)
+}
+
+func (s *Datadog) send(ctx context.Context, m *blip.Metrics, allowCheckpoint bool) error {
 	status.Monitor(s.monitorId, s.Name(), "sending metrics")
 
 	// Pre-alloc data points if using Datadog API (not DogStatsD)
@@ -180,6 +186,10 @@ func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
 	if n == 0 {
 		blip.Debug("%s: zero metric values collect: %s", m)
 		return nil
+	}
+	if !s.dogstatsd && allowCheckpoint {
+		_, err := s.SendWithCheckpoint(ctx, m, nil)
+		return err
 	}
 	if !s.dogstatsd {
 		dp = make([]datadogV2.MetricSeries, n)
@@ -320,6 +330,10 @@ func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
 	}
 
 	return s.sendAPI(ctx, dp[:n], m)
+}
+
+func (s *Datadog) sendDogStatsD(ctx context.Context, m *blip.Metrics) error {
+	return s.send(ctx, m, false)
 }
 
 func (s *Datadog) Name() string {

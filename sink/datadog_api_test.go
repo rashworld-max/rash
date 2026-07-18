@@ -9,13 +9,43 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cashapp/blip"
 )
 
 type rejectThenFailSubmitter struct {
 	calls int
+}
+
+type checkpointFailureSubmitter struct {
+	calls         int
+	acceptedNames map[string]int
+	acceptedBody  map[string]int
+}
+
+func (s *checkpointFailureSubmitter) Submit(_ context.Context, payload preparedDatadogPayload) (datadogSubmitResult, error) {
+	s.calls++
+	if s.calls == 2 {
+		return datadogSubmitResult{}, errors.New("injected checkpoint failure")
+	}
+
+	var decoded datadogV2.MetricPayload
+	if err := json.Unmarshal(payload.body, &decoded); err != nil {
+		return datadogSubmitResult{}, err
+	}
+	if s.acceptedNames == nil {
+		s.acceptedNames = map[string]int{}
+		s.acceptedBody = map[string]int{}
+	}
+	for _, series := range decoded.Series {
+		s.acceptedNames[series.Metric]++
+	}
+	s.acceptedBody[string(payload.body)]++
+	return datadogSubmitResult{statusCode: http.StatusAccepted}, nil
 }
 
 func (s *rejectThenFailSubmitter) Submit(context.Context, preparedDatadogPayload) (datadogSubmitResult, error) {
@@ -94,4 +124,40 @@ func TestPrepareDatadogPayloadStopsOnCancellation(t *testing.T) {
 	series := catalystMetricSeriesSized(10, 0, 0)
 	_, _, err := prepareDatadogPayload(ctx, series, 0, 10, true, defaultDatadogPayloadLimits())
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestDatadogRetryCheckpointDoesNotResendAcknowledgedPayload(t *testing.T) {
+	const metricCount = 40
+	submitter := &checkpointFailureSubmitter{}
+	sender := &Datadog{
+		monitorId: "checkpoint-test",
+		compress:  false,
+		payloadLimits: datadogPayloadLimits{
+			maxCompressed:      1_500,
+			maxDecompressed:    10_000,
+			targetCompressed:   1_200,
+			targetDecompressed: 9_000,
+			maxSeries:          metricCount,
+		},
+		submitter: submitter,
+	}
+	sender.maxSeriesPerRequest.Store(metricCount)
+	retry := NewRetry(RetryArgs{
+		MonitorId:     "checkpoint-test",
+		Sink:          sender,
+		BufferSize:    2,
+		SendTimeout:   5 * time.Second,
+		SendRetryWait: time.Millisecond,
+	})
+
+	require.NoError(t, retry.Send(context.Background(), getBlipMetrics(metricCount, blip.GAUGE, 1, false)))
+	require.Greater(t, submitter.calls, 3, "test data must span at least three chunks")
+	require.Equal(t, metricCount, len(submitter.acceptedNames))
+	for name, count := range submitter.acceptedNames {
+		require.Equalf(t, 1, count, "acknowledged metric %s was submitted more than once", name)
+	}
+	for body, count := range submitter.acceptedBody {
+		require.Equalf(t, 1, count, "acknowledged payload was submitted more than once: %s", body)
+	}
+	require.Equal(t, -1, retry.top, "successful resume should remove the checkpointed queue entry")
 }

@@ -22,7 +22,7 @@ func stack(rb *Retry) []string {
 		if rb.stack[i] == nil {
 			stack = append(stack, "")
 		} else {
-			stack = append(stack, rb.stack[i].Level)
+			stack = append(stack, rb.stack[i].metrics.Level)
 		}
 	}
 	return stack
