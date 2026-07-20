@@ -3,18 +3,14 @@
 package sink
 
 import (
-	"bytes"
-	"compress/zlib"
 	"context"
-	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
-	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
@@ -30,7 +26,7 @@ import (
 var portRe = regexp.MustCompile(`:\d+$`)
 
 const (
-	MAX_PAYLOAD_SIZE int = 512000
+	MAX_PAYLOAD_SIZE int = datadogMaxCompressedPayloadSize
 )
 
 // Datadog sends metrics to Datadog.
@@ -42,15 +38,13 @@ type Datadog struct {
 	event     event.MonitorReceiver
 
 	// -- Api
-	metricsApi *datadogV2.MetricsApi
-	apiKeyAuth string
-	appKeyAuth string
-	resources  []datadogV2.MetricResource
-	compress   bool
-
-	maxMetricsPerRequest     int // Limit the number of metrics we send per request. Only used with the API
-	maxMetricsPerRequestLock sync.Mutex
-	maxPayloadSize           int
+	apiKeyAuth          string
+	appKeyAuth          string
+	resources           []datadogV2.MetricResource
+	compress            bool
+	submitter           datadogMetricSubmitter
+	payloadLimits       datadogPayloadLimits
+	maxSeriesPerRequest atomic.Int64
 
 	// -- DogStatsD
 	dogstatsd       bool
@@ -76,16 +70,17 @@ func NewDatadog(monitorId string, opts, tags map[string]string, httpClient *http
 			}
 		}
 	}
+	sort.Strings(tagList)
 
 	d := &Datadog{
-		monitorId:            monitorId,
-		event:                event.MonitorReceiver{MonitorId: monitorId},
-		tags:                 tagList,
-		resources:            resources,
-		maxMetricsPerRequest: math.MaxInt32, // By default, don't limit the number of metrics per request.
-		compress:             true,
-		maxPayloadSize:       MAX_PAYLOAD_SIZE,
+		monitorId:     monitorId,
+		event:         event.MonitorReceiver{MonitorId: monitorId},
+		tags:          tagList,
+		resources:     resources,
+		compress:      true,
+		payloadLimits: defaultDatadogPayloadLimits(),
 	}
+	d.maxSeriesPerRequest.Store(int64(d.payloadLimits.maxSeries))
 
 	for k, v := range opts {
 		switch k {
@@ -164,14 +159,20 @@ func NewDatadog(monitorId string, opts, tags map[string]string, httpClient *http
 		c := datadog.NewConfiguration()
 		c.HTTPClient = httpClient
 		c.Compress = d.compress
-		metricsApi := datadogV2.NewMetricsApi(datadog.NewAPIClient(c))
-		d.metricsApi = metricsApi
+		d.submitter = &datadogAPISubmitter{
+			client: datadog.NewAPIClient(c),
+			apiKey: d.apiKeyAuth,
+		}
 	}
 
 	return d, nil
 }
 
 func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
+	return s.send(ctx, m, true)
+}
+
+func (s *Datadog) send(ctx context.Context, m *blip.Metrics, allowCheckpoint bool) error {
 	status.Monitor(s.monitorId, s.Name(), "sending metrics")
 
 	// Pre-alloc data points if using Datadog API (not DogStatsD)
@@ -186,6 +187,10 @@ func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
 		blip.Debug("%s: zero metric values collect: %s", m)
 		return nil
 	}
+	if !s.dogstatsd && allowCheckpoint {
+		_, err := s.SendWithCheckpoint(ctx, m, nil)
+		return err
+	}
 	if !s.dogstatsd {
 		dp = make([]datadogV2.MetricSeries, n)
 	}
@@ -195,25 +200,6 @@ func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
 	defer func() {
 		status.Monitor(s.monitorId, s.Name(), "last sent %d metrics at %s", n, time.Now())
 	}()
-
-	// Make a copy of maxMetricsPerRequest in case it gets updated by other threads
-	localMaxMetricsPerRequest := s.maxMetricsPerRequest
-	rangeStart := 0
-	var apiErrors []string
-
-	// Setup our context for API calls
-	ddCtx := context.WithValue(
-		ctx,
-		datadog.ContextAPIKeys,
-		map[string]datadog.APIKey{
-			"apiKeyAuth": {
-				Key: s.apiKeyAuth,
-			},
-			"appKeyAuth": {
-				Key: s.apiKeyAuth,
-			},
-		},
-	)
 
 	// Convert Blip metric values to Datadog data points
 	for domain := range m.Values { // each domain
@@ -328,14 +314,6 @@ func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
 			}
 
 			n++
-
-			// Check if we have reached the maximum number of metrics per request
-			if !s.dogstatsd && n%localMaxMetricsPerRequest == 0 {
-				if err := s.sendApi(ddCtx, dp[rangeStart:n]); err != nil {
-					apiErrors = append(apiErrors, err.Error())
-				}
-				rangeStart = n
-			}
 		} // metric
 	} // domain
 
@@ -351,128 +329,11 @@ func (s *Datadog) Send(ctx context.Context, m *blip.Metrics) error {
 		return nil // success (dogstatsd)
 	}
 
-	if n-rangeStart > 0 {
-		if err := s.sendApi(ddCtx, dp[rangeStart:n]); err != nil {
-			apiErrors = append(apiErrors, err.Error())
-		}
-	}
-
-	if len(apiErrors) > 0 {
-		return fmt.Errorf("%s", strings.Join(apiErrors, "\n"))
-	}
-
-	return nil // success (API)
+	return s.sendAPI(ctx, dp[:n], m)
 }
 
-// Send metrics to the API taking into consideration the number of metrics sent per request.
-func (s *Datadog) sendApi(ddCtx context.Context, dp []datadogV2.MetricSeries) error {
-	localMaxMetricsPerRequest := s.maxMetricsPerRequest
-
-	for rangeStart := 0; rangeStart < len(dp); {
-		// Determine the subetset of metrics to send based on our
-		// max per request
-		rangeEnd := rangeStart + localMaxMetricsPerRequest
-		if rangeEnd > len(dp) {
-			rangeEnd = len(dp)
-		}
-
-		optParams := *datadogV2.NewSubmitMetricsOptionalParameters()
-		if s.compress {
-			optParams.ContentEncoding = datadogV2.METRICCONTENTENCODING_GZIP.Ptr()
-		}
-
-		apiResponse, r, err := s.metricsApi.SubmitMetrics(ddCtx, *datadogV2.NewMetricPayload(dp[rangeStart:rangeEnd]), optParams)
-		if err != nil {
-			if r != nil {
-				if r.StatusCode == http.StatusRequestEntityTooLarge {
-					// Is the number of metrics sent already the smallest possible?
-					if localMaxMetricsPerRequest == 1 {
-						return fmt.Errorf("HTTP status %d (request too large) but dynamic request size at minimum: 1 metric per request; send err: %v; response body: %v", r.StatusCode, err, r.Body)
-					}
-
-					// The payload was too large, so we need to recalculate it and try with a smaller size
-					var err2 error
-					if localMaxMetricsPerRequest, err2 = s.estimateMaxMetricsPerRequest(dp[rangeStart:rangeEnd], localMaxMetricsPerRequest); err2 != nil {
-						return fmt.Errorf("HTTP status %d (request too large) and error estimating new dynamic request size: %v; send err: %v; response body: %v", r.StatusCode, err2, err, r.Body)
-					}
-
-					continue // Retry the metrics with the new payload size
-				}
-				return fmt.Errorf("%s (HTTP status %d: %v)", err, r.StatusCode, r.Body)
-			}
-
-			return fmt.Errorf("network error (nil response): %v", err)
-		}
-
-		// Datadog can return a 202 Accepted response _and_ errors in the response.
-		// This probably means partial success, so keep sending but log the error.
-		if len(apiResponse.Errors) > 0 {
-			errMsg := fmt.Sprintf("Datadog returned success and %d errors: %s", len(apiResponse.Errors), strings.Join(apiResponse.Errors, ", "))
-			s.event.Errorf(event.SINK_SERVER_ERROR, "%s", errMsg)
-		}
-
-		rangeStart = rangeEnd
-	}
-
-	// Update the maxMetricsPerRequest for the sink
-	if localMaxMetricsPerRequest < s.maxMetricsPerRequest {
-		s.maxMetricsPerRequestLock.Lock()
-		// Check the value again in case it changed after getting the lock
-		if localMaxMetricsPerRequest < s.maxMetricsPerRequest {
-			s.maxMetricsPerRequest = localMaxMetricsPerRequest
-		}
-		s.maxMetricsPerRequestLock.Unlock()
-	}
-
-	return nil
-}
-
-// Estimate the number of metrics we can send in a payload based on a sample metric
-func (s *Datadog) estimateMaxMetricsPerRequest(metrics []datadogV2.MetricSeries, currentMaxMetricsPerRequest int) (int, error) {
-	// Estimate the size of a single metric
-	estMetricSize, err := s.estimateSize(metrics)
-	if err != nil {
-		return 0, err
-	}
-
-	// Using our estimated metric size determine out how many metrics can fit inside the max payload, but pad it slightly to control for headers, etc.
-	estMaxMetricsPerRequest := (s.maxPayloadSize - 300) / estMetricSize
-
-	if estMaxMetricsPerRequest >= currentMaxMetricsPerRequest {
-		// If the estimated maximum is greater than what we currently have set as the maximum then
-		// reduce the current maximum by 10% as a guess for finding a maximnum number of metrics
-		// to send that will not be rejected by the API.
-		estMaxMetricsPerRequest = int(float32(currentMaxMetricsPerRequest) * .9)
-	}
-
-	// Ensure we send at least one metric per request
-	if estMaxMetricsPerRequest <= 0 {
-		estMaxMetricsPerRequest = 1
-	}
-
-	return estMaxMetricsPerRequest, nil
-}
-
-// Estimate the size of a metric payload for use in determining the maximum number of
-// metrics per request. We take the total size of the payload and divide by the number
-// of metrics.
-func (s *Datadog) estimateSize(metrics []datadogV2.MetricSeries) (int, error) {
-	data, err := json.Marshal(metrics)
-	if err != nil {
-		return 0, err
-	}
-
-	size := len(data)
-
-	if s.compress {
-		var b bytes.Buffer
-		w := zlib.NewWriter(&b)
-		w.Write(data)
-		w.Close()
-		size = len(b.Bytes())
-	}
-
-	return size / len(metrics), nil
+func (s *Datadog) sendDogStatsD(ctx context.Context, m *blip.Metrics) error {
+	return s.send(ctx, m, false)
 }
 
 func (s *Datadog) Name() string {

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"sync"
 	"testing"
@@ -151,6 +150,8 @@ func TestDatadogSendBoundedByClientTimeout(t *testing.T) {
 
 func TestDatadogMetricsPerRequest(t *testing.T) {
 	callCount := 0
+	rejectedCount := 0
+	maxBodySize := 0
 	testPayloadSize := 5000
 	metricCount := 100
 
@@ -163,8 +164,12 @@ func TestDatadogMetricsPerRequest(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
+				if bodySize > maxBodySize {
+					maxBodySize = bodySize
+				}
 
 				if bodySize > testPayloadSize {
+					rejectedCount++
 					return &http.Response{
 						StatusCode: http.StatusRequestEntityTooLarge,
 					}, nil
@@ -180,11 +185,9 @@ func TestDatadogMetricsPerRequest(t *testing.T) {
 	ops := defaultOps()
 	ops["api-compress"] = "false" // Turn off compression so that we get easier calculations for sizing
 	ddSink, err := NewDatadog("testmonitor", ops, map[string]string{}, httpClient)
-	ddSink.maxPayloadSize = testPayloadSize // Set the payload size for testing
-
-	if err != nil {
-		t.Fatalf("Expected no error but got %v", err)
-	}
+	require.NoError(t, err)
+	ddSink.payloadLimits.maxCompressed = testPayloadSize
+	ddSink.payloadLimits.targetCompressed = testPayloadSize * 9 / 10
 
 	err = ddSink.Send(context.Background(), getBlipMetrics(metricCount, blip.GAUGE, 1.0, false))
 
@@ -192,17 +195,15 @@ func TestDatadogMetricsPerRequest(t *testing.T) {
 		t.Fatalf("Expected no error but got %v", err)
 	}
 
-	if ddSink.maxMetricsPerRequest == math.MaxInt {
-		t.Error("Expected maxMetricsPerRequest to be adjusted but got MaxInt")
-	}
-
-	if callCount != 4 {
-		t.Errorf("Expected 4 calls but got %d", callCount)
-	}
+	require.Greater(t, callCount, 1)
+	require.Zero(t, rejectedCount, "locally-sized requests should not receive HTTP 413")
+	require.LessOrEqual(t, maxBodySize, testPayloadSize)
 }
 
 func TestDatadogMetricsPerRequestWithCompression(t *testing.T) {
 	callCount := 0
+	rejectedCount := 0
+	maxBodySize := 0
 	testPayloadSize := 1500
 	metricCount := 600
 
@@ -216,7 +217,11 @@ func TestDatadogMetricsPerRequestWithCompression(t *testing.T) {
 					return nil, err
 				}
 
+				if bodySize > maxBodySize {
+					maxBodySize = bodySize
+				}
 				if bodySize > testPayloadSize {
+					rejectedCount++
 					return &http.Response{
 						StatusCode: http.StatusRequestEntityTooLarge,
 					}, nil
@@ -231,11 +236,9 @@ func TestDatadogMetricsPerRequestWithCompression(t *testing.T) {
 
 	ops := defaultOps()
 	ddSink, err := NewDatadog("testmonitor", ops, map[string]string{}, httpClient)
-	ddSink.maxPayloadSize = testPayloadSize // Set the payload size for testing
-
-	if err != nil {
-		t.Fatalf("Expected no error but got %v", err)
-	}
+	require.NoError(t, err)
+	ddSink.payloadLimits.maxCompressed = testPayloadSize
+	ddSink.payloadLimits.targetCompressed = testPayloadSize * 9 / 10
 
 	err = ddSink.Send(context.Background(), getBlipMetrics(metricCount, blip.GAUGE, 1.0, false))
 
@@ -243,16 +246,12 @@ func TestDatadogMetricsPerRequestWithCompression(t *testing.T) {
 		t.Fatalf("Expected no error but got %v", err)
 	}
 
-	if ddSink.maxMetricsPerRequest == math.MaxInt {
-		t.Error("Expected maxMetricsPerRequest to be adjusted but got MaxInt")
-	}
-
-	if callCount == 1 {
-		t.Error("Expected more than 1 call but got only 1")
-	}
+	require.Greater(t, callCount, 1)
+	require.Zero(t, rejectedCount, "locally-sized requests should not receive HTTP 413")
+	require.LessOrEqual(t, maxBodySize, testPayloadSize)
 }
 
-func TestDatadogMetricsPerRequestMultipleFail(t *testing.T) {
+func TestDatadogMetricsPerRequestHeterogeneousSeries(t *testing.T) {
 	callCount := 0
 	testPayloadSize := 5000
 	metricCount := 500
@@ -295,7 +294,9 @@ func TestDatadogMetricsPerRequestMultipleFail(t *testing.T) {
 	ops := defaultOps()
 	ops["api-compress"] = "false" // Turn off compression so that we get easier calculations for sizing
 	ddSink, err := NewDatadog("testmonitor", ops, map[string]string{}, httpClient)
-	ddSink.maxPayloadSize = testPayloadSize // Set the payload size for testing
+	require.NoError(t, err)
+	ddSink.payloadLimits.maxCompressed = testPayloadSize
+	ddSink.payloadLimits.targetCompressed = testPayloadSize * 9 / 10
 	ddSink.tr = &mock.Tr{
 		TranslateFunc: func(domain, metric string) string {
 			trCount++
@@ -309,19 +310,11 @@ func TestDatadogMetricsPerRequestMultipleFail(t *testing.T) {
 		},
 	}
 
-	if err != nil {
-		t.Fatalf("Expected no error but got %v", err)
-	}
-
 	blipMetrics := getBlipMetrics(metricCount, blip.GAUGE, 1.0, false)
 	err = ddSink.Send(context.Background(), blipMetrics)
 
 	if err != nil {
 		t.Fatalf("Expected no error but got %v", err)
-	}
-
-	if ddSink.maxMetricsPerRequest == math.MaxInt {
-		t.Error("Expected maxMetricsPerRequest to be adjusted but got MaxInt")
 	}
 
 	if callCount == 1 {

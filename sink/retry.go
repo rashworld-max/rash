@@ -37,9 +37,21 @@ type Retry struct {
 	event event.MonitorReceiver
 
 	stackMux *sync.Mutex
-	stack    []*blip.Metrics // LIFO
+	stack    []*retryItem // LIFO
 	max      int
 	top      int
+}
+
+// CheckpointSink can resume a partially acknowledged metrics batch. Retry
+// stores the opaque checkpoint with the same queue entry as the metrics. A
+// sink must advance the returned checkpoint only after remote acknowledgement.
+type CheckpointSink interface {
+	SendWithCheckpoint(context.Context, *blip.Metrics, any) (any, error)
+}
+
+type retryItem struct {
+	metrics    *blip.Metrics
+	checkpoint any
 }
 
 type RetryArgs struct {
@@ -84,7 +96,7 @@ func NewRetry(args RetryArgs) *Retry {
 		retryWait:   args.SendRetryWait,
 
 		stackMux: &sync.Mutex{},
-		stack:    make([]*blip.Metrics, args.BufferSize),
+		stack:    make([]*retryItem, args.BufferSize),
 		max:      int(args.BufferSize) - 1,
 		top:      -1,
 	}
@@ -100,7 +112,7 @@ func (rb *Retry) Name() string {
 // Send buffers, sends, and retries sending metrics on failure. It is safe to call
 // from multiple goroutines.
 func (rb *Retry) Send(ctx context.Context, m *blip.Metrics) error {
-	rb.push(m) // top of stack
+	rb.push(&retryItem{metrics: m}) // top of stack
 
 	rb.sendMux.Lock()
 	if rb.sending {
@@ -141,7 +153,13 @@ func (rb *Retry) Send(ctx context.Context, m *blip.Metrics) error {
 		n += 1
 
 		// Send next oldest metrics
-		if err := rb.sink.Send(ctx2, next); err != nil {
+		var err error
+		if sink, ok := rb.sink.(CheckpointSink); ok {
+			next.checkpoint, err = sink.SendWithCheckpoint(ctx2, next.metrics, next.checkpoint)
+		} else {
+			err = rb.sink.Send(ctx2, next.metrics)
+		}
+		if err != nil {
 			rb.event.Errorf(event.SINK_SEND_ERROR, "%s", err.Error())
 			next = nil // don't pop metrics; retry stack from top down
 		}
@@ -150,7 +168,7 @@ func (rb *Retry) Send(ctx context.Context, m *blip.Metrics) error {
 	return nil
 }
 
-func (rb *Retry) push(m *blip.Metrics) {
+func (rb *Retry) push(item *retryItem) {
 	rb.stackMux.Lock()
 	defer rb.stackMux.Unlock()
 	if rb.top < rb.max {
@@ -159,10 +177,10 @@ func (rb *Retry) push(m *blip.Metrics) {
 		// Push down stack (push off oldest metrics)
 		copy(rb.stack, rb.stack[1:])
 	}
-	rb.stack[rb.top] = m
+	rb.stack[rb.top] = item
 }
 
-func (rb *Retry) pop(sent *blip.Metrics) *blip.Metrics {
+func (rb *Retry) pop(sent *retryItem) *retryItem {
 	rb.stackMux.Lock()
 	defer rb.stackMux.Unlock()
 

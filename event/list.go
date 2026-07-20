@@ -66,6 +66,7 @@ const (
 // Sink Events
 const (
 	SINK_INVALID_METRICS = "sink-invalid-metrics" // invalid metrics, drop
+	SINK_PAYLOAD         = "sink-payload"         // payload sizing and submission diagnostics
 	SINK_SERVER_ERROR    = "sink-server-error"    // send ok but remote server returned an error
 	SINK_SEND_ERROR      = "sink-send-error"      // e.g. network timeout
 )
